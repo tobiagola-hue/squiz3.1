@@ -1,0 +1,191 @@
+# ============================================
+# 🧠 CONVERTITORE AUTOMATICO IMMAGINE/VIDEO → ASCII NITIDO
+# (pochi caratteri, forme chiare, tempo stimato)
+# ============================================
+
+!pip install pillow numpy ipywidgets tqdm opencv-python moviepy --quiet
+
+import numpy as np
+from PIL import Image, ImageEnhance, ImageDraw, ImageFont
+from google.colab import files
+import ipywidgets as widgets
+from IPython.display import display, clear_output
+from collections import Counter
+import cv2, os, time
+from moviepy.editor import ImageSequenceClip
+from tqdm.notebook import tqdm
+
+# ---------- CONFIG ----------
+PROFILES = {"10 caratteri": 10, "50 caratteri": 50, "100 caratteri": 100}
+ASCII_GRADIENT = " .:-=+*#%@"
+CHARSETS = {"Forme nitide": ASCII_GRADIENT}
+DEFAULT_PROFILE = "50 caratteri"
+
+# ---------- FUNZIONI BASE ----------
+def load_mono_font(preferred_size=12):
+    candidates = [
+        "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationMono-Regular.ttf",
+        "/usr/share/fonts/truetype/ubuntu/UbuntuMono-R.ttf"
+    ]
+    for c in candidates:
+        if os.path.exists(c):
+            return ImageFont.truetype(c, preferred_size)
+    return ImageFont.load_default()
+
+def measure_char_size(font):
+    bbox = font.getbbox("M")
+    return bbox[2] - bbox[0], bbox[3] - bbox[1]
+
+def hex_to_rgb(hex_color):
+    hex_color = hex_color.lstrip("#")
+    return tuple(int(hex_color[i:i+2], 16) for i in (0, 2, 4))
+
+def enhance_gray(gray):
+    gray = ImageEnhance.Contrast(gray).enhance(1.8)
+    gray = ImageEnhance.Sharpness(gray).enhance(2.0)
+    return gray
+
+def image_to_ascii_frame(img, width_chars, text_color, bg_color):
+    """Converte un frame (OpenCV o PIL) in immagine ASCII"""
+    if isinstance(img, np.ndarray):
+        img = Image.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
+
+    orig_w, orig_h = img.size
+    gray = enhance_gray(img.convert("L"))
+
+    ratio = orig_h / orig_w / 0.5
+    new_h = max(1, int(width_chars * ratio))
+    small = gray.resize((width_chars, new_h), Image.BICUBIC)
+
+    arr = np.array(small) / 255.0
+    gamma = 2.4
+    arr = arr ** (1 / gamma)
+
+    ascii_chars = CHARSETS["Forme nitide"]
+    levels = len(ascii_chars)
+    indices = (arr * (levels - 1)).astype(int)
+    ascii_lines = ["".join(ascii_chars[i] for i in row) for row in indices]
+
+    font = load_mono_font(14)
+    char_w, char_h = measure_char_size(font)
+    img_px_w = char_w * len(ascii_lines[0])
+    img_px_h = char_h * len(ascii_lines)
+    padding = 4
+
+    out_img = Image.new("RGB", (img_px_w + padding * 2, img_px_h + padding * 2), color=bg_color)
+    draw = ImageDraw.Draw(out_img)
+    y = padding
+    for line in ascii_lines:
+        draw.text((padding, y), line, fill=text_color, font=font)
+        y += char_h
+
+    out_img = out_img.resize((orig_w, orig_h), Image.BICUBIC)
+    return np.array(out_img)
+
+# ---------- INTERFACCIA ----------
+upload_btn = widgets.FileUpload(accept='image/*,video/*', multiple=False)
+profile_select = widgets.Dropdown(options=list(PROFILES.keys()), value=DEFAULT_PROFILE, description='Risoluzione:')
+color_mode = widgets.RadioButtons(options=["Verde/Nero", "Personalizzato"], description='Colori:')
+text_color_picker = widgets.ColorPicker(value='#00ff00', description='Colore testo:')
+bg_color_picker = widgets.ColorPicker(value='#000000', description='Sfondo:')
+run_btn = widgets.Button(description="Converti (Immagine o Video)", button_style='success')
+output_area = widgets.Output(layout={'border': '1px solid gray'})
+
+ui = widgets.VBox([
+    widgets.HTML("<h3>🟢 ASCII Nitido — IMMAGINE o VIDEO (pochi caratteri, forme chiare)</h3>"),
+    upload_btn,
+    profile_select,
+    color_mode,
+    widgets.HBox([text_color_picker, bg_color_picker]),
+    run_btn,
+    output_area
+])
+display(ui)
+
+# ---------- CONVERSIONE ----------
+def process_file(file_info, width_chars, text_color_hex, bg_color_hex):
+    for name, info in file_info.items():
+        with open(name, "wb") as f:
+            f.write(info["content"])
+        filename = name
+
+    ext = filename.lower().split(".")[-1]
+    is_video = ext in ["mp4", "mov", "avi", "mkv"]
+
+    with output_area:
+        clear_output()
+        print(f"📁 File caricato: {filename}")
+        print("🔍 Tipo:", "🎞️ Video" if is_video else "🖼️ Immagine")
+        print("⏳ Elaborazione in corso...")
+
+    text_color = hex_to_rgb(text_color_hex)
+    bg_color = hex_to_rgb(bg_color_hex)
+
+    if not is_video:
+        img = Image.open(filename)
+        ascii_img = image_to_ascii_frame(img, width_chars, text_color, bg_color)
+        out_name = f"ascii_nitido_{width_chars}.jpg"
+        Image.fromarray(ascii_img).save(out_name, quality=95)
+
+        with output_area:
+            clear_output()
+            print("✅ Conversione completata (immagine)")
+            print("📁 File:", out_name)
+        files.download(out_name)
+        return
+
+    # 🎞️ VIDEO MODE
+    cap = cv2.VideoCapture(filename)
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+
+    frames = []
+    success, frame = cap.read()
+
+    if not success:
+        with output_area:
+            clear_output()
+            print("⚠️ Errore: impossibile leggere il video.")
+        return
+
+    start_time = time.time()
+    with tqdm(total=total, desc="🎬 Conversione frame", ncols=80) as pbar:
+        frame_count = 0
+        while success:
+            ascii_frame = image_to_ascii_frame(frame, width_chars, text_color, bg_color)
+            frames.append(ascii_frame)
+            frame_count += 1
+
+            elapsed = time.time() - start_time
+            if frame_count > 0:
+                avg_time_per_frame = elapsed / frame_count
+                remaining_time = avg_time_per_frame * (total - frame_count)
+                pbar.set_postfix_str(f"⏱️ {remaining_time:.1f}s rimasti")
+
+            success, frame = cap.read()
+            pbar.update(1)
+
+    cap.release()
+
+    out_video = "ascii_video_nitido.mp4"
+    clip = ImageSequenceClip([f[:, :, ::-1] for f in frames], fps=fps)
+    clip.write_videofile(out_video, codec="libx264", audio=False, verbose=False, logger=None)
+
+    with output_area:
+        clear_output()
+        print("✅ Conversione completata (video ASCII)")
+        print(f"🎥 FPS: {fps:.1f} | Frame totali: {total}")
+        print("📁 File:", out_video)
+    files.download(out_video)
+
+def on_run_click(b):
+    if not upload_btn.value:
+        with output_area:
+            clear_output()
+            print("⚠️ Nessun file caricato!")
+        return
+    width_chars = PROFILES[profile_select.value]
+    process_file(upload_btn.value, width_chars, text_color_picker.value, bg_color_picker.value)
+
+run_btn.on_click(on_run_click)
